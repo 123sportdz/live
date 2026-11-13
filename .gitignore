@@ -1,0 +1,30 @@
+# Secrets and credentials — never commit or share
+.env
+.env.*
+!.env.example
+!src/live_relay/.env.example
+client_secret*.json
+oauth-client*.json
+*.key
+*.pem
+*.p12
+auto.crt
+youtube-token.json
+cookies*.txt
+
+# Local state, recordings, logs
+*.log
+recordings/
+state/
+live-relay-*.zip
+
+# Python and tooling caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.test-venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/

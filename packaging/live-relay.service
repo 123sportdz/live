@@ -1,0 +1,21 @@
+[Unit]
+Description=Live Relay — 24/7 broadcast relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust this path if the project lives elsewhere.
+WorkingDirectory=%h/live-relay
+ExecStart=%h/live-relay/.venv/bin/python -m live_relay --headless
+Environment=PYTHONUNBUFFERED=1
+# The built-in supervisor restarts the relay in-process; systemd restarts it
+# if the whole process dies.
+Restart=always
+RestartSec=10
+# Stop cleanly so YouTube receives the "complete" transition.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+[Install]
+WantedBy=default.target

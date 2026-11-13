@@ -1,0 +1,3 @@
+DejaVu fonts — Bitstream Vera Fonts Copyright (c) 2003 Bitstream, Inc.
+Public domain additions by the DejaVu project.
+See https://dejavu-fonts.github.io/License.html
