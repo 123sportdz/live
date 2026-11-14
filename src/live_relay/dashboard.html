@@ -67,6 +67,15 @@
 .ads-details{margin-top:12px}
 .ads-details .inside p{margin:0 0 8px}
 @media(max-width:620px){.ads-grid{grid-template-columns:1fr;justify-items:center;text-align:center}.ads-risks{text-align:right;width:100%}.ads-risks .risk-top{justify-content:center}}
+.episode-grid{display:grid;grid-template-columns:1.35fr .65fr;gap:14px}
+.episode-grid .field{margin-bottom:0}
+.bar{height:8px;border-radius:999px;background:#0d141c;border:1px solid var(--line);overflow:hidden;margin:11px 0}
+.bar span{display:block;height:100%;width:0;background:linear-gradient(90deg,#35d49a,#70a7ff);transition:width .3s}
+.episode-list{margin-top:12px;display:grid;gap:8px}
+.episode-item{border:1px solid var(--line);border-radius:11px;background:#0d141c;padding:10px 12px;font-size:12px}
+.episode-item b{display:block;margin-bottom:3px}
+.episode-item code{font-size:10px;color:#9fb0bf;direction:ltr;display:block;overflow-wrap:anywhere}
+@media(max-width:760px){.episode-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -98,6 +107,19 @@
 <div class="actions"><button id="kit-btn" class="btn outline" type="button">افتح ملف آخر حلقة</button><span id="kit-path" class="subtle"></span></div>
 <div id="news-result" class="message" aria-live="polite"></div>
 <details class="ads-details"><summary>لماذا هذه الخطوة هي الحل، وليست إضافة تجميلية؟</summary><div class="inside"><p>الشعار والإطار لا يغيّران المحتوى. المقطع الأصلي يغيّره: كلامك، تحليلك، وأسئلتك. تسجيل المقطع هنا يفعل شيئين: يحوّله إلى فصل ظاهر في الـVOD، ويحوّل «أضفت تعليقاً» إلى رقم في تقييم الأهلية بدل التخمين.</p><p>الموجز لا يخترع وقائع: نقاطه مقتبسة حرفياً من وصف المصدر، والباقي أسئلة تجيب عنها أنت على الهواء. إن كان الوصف فارغاً سيقول لك ذلك صراحةً.</p><p>ملف الحلقة يُكتب محلياً في <code>kits/</code> عند نهاية البث، ويجمع الموجز والفصول والوصف والتقييم ومسار التسجيل.</p></div></details>
+</section>
+<section class="card" id="episode-card">
+<div class="card-head"><div><h2>الحلقة اليومية</h2><p>حوّل تسجيلاتك إلى برنامج كامل: مقدمة، مقاطع، فواصل، خاتمة، غلاف وفصول — ملف MP4 جاهز للرفع.</p></div><span id="episode-badge" class="status-pill">لم تُبنَ بعد</span></div>
+<div class="episode-grid">
+  <div class="field"><label for="episode-manifest">ملف الحلقة (JSON)</label><input id="episode-manifest" value="episodes/today.json" dir="ltr" autocomplete="off"><p class="hint">أنشئه من التسجيلات ثم عدّل العناوين وأضف تعليقك الصوتي.</p></div>
+  <div class="field"><label>خيارات</label><label class="check"><input id="episode-short" type="checkbox"> السماح بحلقة قصيرة (للتجربة)</label></div>
+</div>
+<div class="actions"><button id="episode-sample" class="btn secondary" type="button">أنشئ ملفاً من التسجيلات</button><button id="episode-plan" class="btn outline" type="button">تخطيط</button><button id="episode-build" class="btn" type="button">بناء الحلقة</button></div>
+<div id="episode-status" class="subtle">لم تُبنَ حلقة بعد.</div>
+<div class="bar" id="episode-bar"><span></span></div>
+<div id="episode-result" class="message" aria-live="polite"></div>
+<div id="episode-list" class="episode-list"></div>
+<details class="ads-details"><summary>ماذا يحدث عند البناء؟</summary><div class="inside"><p>كل مقطع يُقصّ ويُوحَّد إلى 1080p، ثم تُرسم بطاقة عربية بين المقاطع، ويُدمج الكل مع صوتك. الناتج: <code>episode.mp4</code> و<code>thumbnail.jpg</code> و<code>chapters.txt</code> و<code>description.md</code> و<code>episode.json</code> داخل مجلد الحلقة.</p><p>البطاقات من تصميم القناة، ولا تُستخدم صور من قناة المصدر. إن كانت المقاطع مسجّلة من مصدر خارجي فالحلقة ليست أصلية، وسيظهر تحذير قبل البناء.</p></div></details>
 </section>
 <main class="grid">
 
@@ -275,7 +297,16 @@ $('weekly-btn').addEventListener('click',async()=>{const button=$('weekly-btn');
 $('export-config-btn').addEventListener('click',async()=>{const button=$('export-config-btn');button.disabled=true;try{const include=Boolean($('export-secrets').checked);const r=await api("/api/config/export","POST",{include_secrets:include});const text=JSON.stringify(r.payload,null,2);const blob=new Blob([text],{type:"application/json;charset=utf-8"});const url=URL.createObjectURL(blob);const link=document.createElement("a");const stamp=new Date().toISOString().slice(0,10);link.href=url;link.download=`live-relay-config-${stamp}${include?"-with-secrets":""}.json`;document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);notice(include?"صُدّرت النسخة مع المفاتيح — احفظها في مكان آمن.":"صُدّرت النسخة بلا مفاتيح.","good");}catch(e){notice(e.message,"error");}finally{button.disabled=false;}});
 $('import-config-btn').addEventListener('click',()=>$('import-config-file').click());
 $('import-config-file').addEventListener('change',async()=>{const input=$('import-config-file');const file=input.files?.[0];if(!file)return;if(file.size>2_000_000){notice("الملف كبير جداً.","error");input.value="";return;}try{const text=await file.text();const parsed=JSON.parse(text);if(!confirm("سيستبدل هذا الملف الإعدادات الحالية. هل تريد المتابعة؟")){input.value="";return;}const r=await api("/api/config/import","POST",{payload:parsed});formLoaded=false;setConfig(r.config,true);notice(`اسْتُوردت الإعدادات: ${r.applied} مفتاحاً (${r.secrets} سرياً).`,"good");await refresh();}catch(e){notice(e.message||"ملف غير صالح.","error");}finally{input.value="";}});
-refresh();setInterval(refresh,4000);
+let episodeRunning=false;
+let episodeWasRunning=false;
+function fmtDuration(value){const total=Math.max(0,Math.round(Number(value)||0));const m=Math.floor(total/60),s=total%60;return `${m}:${String(s).padStart(2,"0")}`;}
+async function loadEpisodes(){try{const r=await api("/api/episodes","GET");const list=r.episodes||[];$('episode-list').innerHTML=list.length?list.map(e=>`<div class="episode-item"><b>${e.title||"حلقة"} · ${fmtDuration(e.duration)}</b><code>${e.path||""}</code></div>`).join(""):'<p class="subtle">لا حلقات مبنية بعد.</p>';if(list.length)$('episode-badge').textContent=`${list.length} حلقة`;}catch(e){}}
+function renderEpisodeStatus(job){const running=Boolean(job.running);episodeRunning=running;const total=Number(job.total)||0,done=Number(job.done)||0;const pct=total?Math.round(done/total*100):0;$('episode-bar').querySelector("span").style.width=pct+"%";if(running){$('episode-badge').textContent="قيد البناء";$('episode-status').textContent=`${job.phase||"جاري"} · ${done}/${total} (${pct}%)`;return true;}if(job.error){$('episode-badge').textContent="فشل";$('episode-status').textContent="فشل البناء: "+job.error;return false;}if(job.phase==="انتهى"){$('episode-badge').textContent="جاهزة";$('episode-status').textContent=`انتهت الحلقة · ${fmtDuration(job.duration)} · ${job.output||""}`;return false;}return false;}
+async function pollEpisode(){try{const r=await api("/api/episodes/status","GET");const running=renderEpisodeStatus(r);if(!running&&episodeWasRunning){episodeWasRunning=false;notice(r.error?"فشل بناء الحلقة.":"اكتملت الحلقة اليومية.",r.error?"error":"good");loadEpisodes();}}catch(e){}}
+$('episode-sample').addEventListener('click',async()=>{const b=$('episode-sample');b.disabled=true;try{const r=await api("/api/episodes/sample","POST",{});$('episode-manifest').value=r.manifest;notice(`أُنشئ ملف الحلقة من ${r.segments} تسجيلات. عدّل العناوين ثم اضغط «تخطيط».`,"good");$('episode-plan').click();}catch(e){notice(e.message,"error");}finally{b.disabled=false;}});
+$('episode-plan').addEventListener('click',async()=>{const b=$('episode-plan');b.disabled=true;try{const r=await api("/api/episodes/plan","POST",{manifest:$('episode-manifest').value,allow_short:$('episode-short').checked});const warn=(r.warnings||[]).join(" ");$('episode-result').textContent=`${r.segments.length} مقاطع · ${fmtDuration(r.total_seconds)} · ${r.chapters.length} فصلاً.`+(warn?" "+warn:"");$('episode-result').className="message "+(warn?"":"good");$('episode-badge').textContent=fmtDuration(r.total_seconds);}catch(e){$('episode-result').textContent=e.message;$('episode-result').className="message error";}finally{b.disabled=false;}});
+$('episode-build').addEventListener('click',async()=>{if(!confirm("سيبدأ بناء الحلقة. قد يستغرق عدة دقائق. هل تريد المتابعة؟"))return;const b=$('episode-build');b.disabled=true;try{const r=await api("/api/episodes/build","POST",{manifest:$('episode-manifest').value,allow_short:$('episode-short').checked});episodeWasRunning=true;renderEpisodeStatus(r);notice("بدأ بناء الحلقة. يمكنك متابعة النسبة هنا.","good");}catch(e){notice(e.message,"error");}finally{b.disabled=false;}});
+loadEpisodes();setInterval(()=>{if(episodeRunning)pollEpisode();},2000);refresh();setInterval(refresh,4000);
 </script>
 </body>
 </html>

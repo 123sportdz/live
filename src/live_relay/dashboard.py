@@ -15,13 +15,22 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import urlsplit
 
 from dotenv import dotenv_values, load_dotenv, set_key
 
 from . import __version__
 from .backup import build_export, validate_import
+from .episode import (
+    MIN_SECONDS,
+    EpisodeError,
+    load_manifest,
+    render_episode,
+    sample_manifest,
+    slugify,
+    write_manifest,
+)
 from .config import (
     default_state_dir,
     ensure_private_dir,
@@ -79,6 +88,7 @@ from .thumbnails import (
     set_manual_hold,
 )
 
+LOGGER = logging.getLogger(__name__)
 PROJECT_ROOT = resolve_project_root()
 SECRET_KEYS = (
     "YOUTUBE_STREAM_KEY",
@@ -218,6 +228,9 @@ class DashboardController:
         self._lock = threading.RLock()
         self._relay_thread: threading.Thread | None = None
         self._stop_event: threading.Event | None = None
+        self._episode_lock = threading.Lock()
+        self._episode_thread: threading.Thread | None = None
+        self._episode_job: dict[str, Any] = {}
         self.status = RelayStatus()
         self.control_token = secrets.token_urlsafe(32)
         self.ensure_env_file()
@@ -790,6 +803,147 @@ class DashboardController:
                 "applied": len(updates),
                 "secrets": len(secrets),
             }
+
+    # -- daily episode -------------------------------------------------
+
+    def _episode_manifest(self, value: Any) -> Path:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("ملف الحلقة مطلوب.")
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            path = self.project_root / path
+        path = path.resolve()
+        if path != self.project_root and self.project_root not in path.parents:
+            raise ValueError("ملف الحلقة يجب أن يكون داخل مجلد المشروع.")
+        if path.suffix.lower() != ".json":
+            raise ValueError("ملف الحلقة يجب أن يكون JSON.")
+        return path
+
+    def episode_sample(self) -> dict[str, Any]:
+        values = self._values()
+        state_dir = self._current_state_dir(values)
+        brand = str(values.get("BRAND_NAME") or "live-relay")
+        title = str(values.get("YOUTUBE_TITLE_OVERRIDE") or "").strip()
+        payload = sample_manifest(
+            state_dir / "recordings",
+            title=title,
+            brand=brand,
+            rights=str(values.get("SOURCE_RIGHTS") or "unknown"),
+        )
+        if not payload["segments"]:
+            raise ValueError(
+                "لا توجد تسجيلات جاهزة. فعّل التسجيل، أوقف بثاً واحداً على الأقل، ثم أعد المحاولة."
+            )
+        target = self.project_root / "episodes" / "today.json"
+        write_manifest(target, payload)
+        return {
+            "ok": True,
+            "manifest": "episodes/today.json",
+            "segments": len(payload["segments"]),
+            "title": payload["title"],
+        }
+
+    def episode_plan(self, data: Mapping[str, Any]) -> dict[str, Any]:
+        plan = load_manifest(self._episode_manifest(data.get("manifest")))
+        allow_short = bool(data.get("allow_short"))
+        if plan.total_seconds < MIN_SECONDS and not allow_short:
+            raise EpisodeError(
+                "الحلقة أقصر من 10 دقائق. أضف مقاطع، أو اسمح بحلقة قصيرة للتجربة."
+            )
+        return {"ok": True, **plan.as_dict(), "allow_short": allow_short}
+
+    def episode_start(self, data: Mapping[str, Any]) -> dict[str, Any]:
+        with self._episode_lock:
+            if self._episode_thread is not None and self._episode_thread.is_alive():
+                raise RuntimeError("هناك حلقة قيد البناء بالفعل.")
+            plan = load_manifest(self._episode_manifest(data.get("manifest")))
+            allow_short = bool(data.get("allow_short"))
+            if plan.total_seconds < MIN_SECONDS and not allow_short:
+                raise EpisodeError(
+                    "الحلقة أقصر من 10 دقائق. أضف مقاطع، أو اسمح بحلقة قصيرة للتجربة."
+                )
+            output = (
+                self._current_state_dir(self._values())
+                / "episodes"
+                / f"{plan.date}-{slugify(plan.title)}"
+            )
+            self._episode_job = {
+                "running": True,
+                "phase": "بدء",
+                "done": 0,
+                "total": len(plan.items),
+                "started_at": time.time(),
+                "title": plan.title,
+                "output": str(output),
+                "error": "",
+                "duration": 0,
+            }
+            self._episode_thread = threading.Thread(
+                target=self._run_episode,
+                args=(plan, output),
+                daemon=True,
+                name="episode-builder",
+            )
+            self._episode_thread.start()
+            return {"ok": True, **self._episode_job}
+
+    def _run_episode(self, plan: Any, output: Path) -> None:
+        def progress(done: int, total: int, phase: str) -> None:
+            with self._episode_lock:
+                self._episode_job.update(
+                    done=done, total=total, phase=phase
+                )
+
+        try:
+            result = render_episode(plan, output, progress=progress)
+        except Exception as exc:  # the job must always end in a readable state
+            LOGGER.exception("episode build failed")
+            with self._episode_lock:
+                self._episode_job.update(
+                    running=False, phase="فشل", error=str(exc)[:500]
+                )
+            return
+        with self._episode_lock:
+            self._episode_job.update(
+                running=False,
+                phase="انتهى",
+                output=str(output),
+                duration=result.get("duration_seconds", 0),
+            )
+
+    def episode_status(self) -> dict[str, Any]:
+        with self._episode_lock:
+            job = dict(self._episode_job)
+        if not job:
+            return {"ok": True, "running": False}
+        return {"ok": True, **job}
+
+    def list_episodes(self) -> dict[str, Any]:
+        root = self._current_state_dir(self._values()) / "episodes"
+        items: list[dict[str, Any]] = []
+        if root.is_dir():
+            for meta in sorted(
+                root.glob("*/episode.json"),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )[:20]:
+                try:
+                    payload = json.loads(meta.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                items.append(
+                    {
+                        "title": payload.get("title", ""),
+                        "date": payload.get("date", ""),
+                        "duration": payload.get("duration_seconds", 0),
+                        "path": str(meta.parent),
+                        "video": str(meta.parent / "episode.mp4"),
+                        "thumbnail": str(meta.parent / "thumbnail.jpg"),
+                        "built_at": payload.get("built_at", 0),
+                    }
+                )
+        return {"ok": True, "episodes": items}
 
     def _metadata_from_request(self, data: dict[str, Any]) -> StreamMetadata:
         raw_title = str(data.get("title", ""))
@@ -1621,6 +1775,10 @@ def build_handler_class(
                 self._json(controller.monetization_summary())
             elif request_path == "/api/session/markers":
                 self._json(controller.session_markers())
+            elif request_path == "/api/episodes":
+                self._json(controller.list_episodes())
+            elif request_path == "/api/episodes/status":
+                self._json(controller.episode_status())
             elif request_path == "/api/reports/weekly":
                 query = urlsplit(self.path).query
                 days = 7
@@ -1728,6 +1886,12 @@ def build_handler_class(
                     self._json(controller.metadata_suggest(data))
                 elif request_path == "/api/newsroom/brief":
                     self._json(controller.newsroom_brief(data))
+                elif request_path == "/api/episodes/sample":
+                    self._json(controller.episode_sample())
+                elif request_path == "/api/episodes/plan":
+                    self._json(controller.episode_plan(data))
+                elif request_path == "/api/episodes/build":
+                    self._json(controller.episode_start(data), 202)
                 elif request_path == "/api/session/marker":
                     self._json(controller.add_session_marker(data))
                 elif request_path == "/api/session/marker/remove":

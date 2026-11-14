@@ -16,6 +16,7 @@ cookies*.txt
 *.log
 recordings/
 state/
+episodes/
 live-relay-*.zip
 
 # Python and tooling caches
