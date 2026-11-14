@@ -31,6 +31,16 @@ from .episode import (
     slugify,
     write_manifest,
 )
+from .cutter import (
+    AI_BACKENDS as CUTTER_AI_BACKENDS,
+    PLATFORMS as CUTTER_PLATFORMS,
+    CutterClient,
+    CutterError,
+    CutterSettings,
+    clips_from_project,
+    latest_recording,
+    list_projects as cutter_projects,
+)
 from .config import (
     default_state_dir,
     ensure_private_dir,
@@ -143,6 +153,14 @@ CONFIG_KEYS = (
     "STALL_TIMEOUT",
     "HEARTBEAT",
     "SOURCE_END_GRACE",
+    "CUTTER_ENABLED",
+    "CUTTER_HOME",
+    "CUTTER_PYTHON",
+    "CUTTER_AI_BACKEND",
+    "CUTTER_SEGMENTS",
+    "CUTTER_PLATFORM",
+    "CUTTER_WORKFLOW",
+    "CUTTER_MODEL",
 )
 
 BACKUP_EXTRA_KEYS = (
@@ -231,6 +249,9 @@ class DashboardController:
         self._episode_lock = threading.Lock()
         self._episode_thread: threading.Thread | None = None
         self._episode_job: dict[str, Any] = {}
+        self._cutter_lock = threading.Lock()
+        self._cutter_thread: threading.Thread | None = None
+        self._cutter_job: dict[str, Any] = {}
         self.status = RelayStatus()
         self.control_token = secrets.token_urlsafe(32)
         self.ensure_env_file()
@@ -496,6 +517,14 @@ class DashboardController:
             "ytdlp_format": values.get("YTDLP_FORMAT", _default_value("YTDLP_FORMAT")),
             "cookie_file": values.get("YTDLP_COOKIE_FILE", ""),
             "cookies_from_browser": values.get("YTDLP_COOKIES_FROM_BROWSER", ""),
+            "cutter_enabled": _as_bool(values.get("CUTTER_ENABLED")),
+            "cutter_home": values.get("CUTTER_HOME", ""),
+            "cutter_python": values.get("CUTTER_PYTHON", ""),
+            "cutter_ai_backend": values.get("CUTTER_AI_BACKEND", "gemini"),
+            "cutter_segments": int(values.get("CUTTER_SEGMENTS") or 6),
+            "cutter_platform": values.get("CUTTER_PLATFORM", "tiktok"),
+            "cutter_workflow": int(values.get("CUTTER_WORKFLOW") or 1),
+            "cutter_model": values.get("CUTTER_MODEL", "large-v3-turbo"),
             "is_running": self._is_running(),
             "missing": missing,
             "notes": notes,
@@ -584,6 +613,29 @@ class DashboardController:
                 raise ValueError("THUMBNAIL_MODE must be auto, local, gemini, or off")
             if "BRAND_NAME" in updates and len(updates["BRAND_NAME"]) > 60:
                 raise ValueError("Keep the brand name under 60 characters")
+            if "CUTTER_SEGMENTS" in updates:
+                try:
+                    cutter_count = int(updates["CUTTER_SEGMENTS"])
+                except ValueError as exc:
+                    raise ValueError("CUTTER_SEGMENTS must be a number") from exc
+                if not 1 <= cutter_count <= 20:
+                    raise ValueError("CUTTER_SEGMENTS must be between 1 and 20")
+            if "CUTTER_AI_BACKEND" in updates and updates[
+                "CUTTER_AI_BACKEND"
+            ] not in CUTTER_AI_BACKENDS:
+                raise ValueError("Choose a supported CUTTER_AI_BACKEND")
+            if "CUTTER_PLATFORM" in updates and updates[
+                "CUTTER_PLATFORM"
+            ] not in CUTTER_PLATFORMS:
+                raise ValueError("Choose a supported CUTTER_PLATFORM")
+            if "CUTTER_WORKFLOW" in updates and updates["CUTTER_WORKFLOW"] not in {
+                "1",
+                "2",
+                "3",
+            }:
+                raise ValueError("CUTTER_WORKFLOW must be 1, 2, or 3")
+            if "CUTTER_HOME" in updates and len(updates["CUTTER_HOME"]) > 500:
+                raise ValueError("Keep the Cutter home path under 500 characters")
             if "TRANSFORM_LEVEL" in updates and updates["TRANSFORM_LEVEL"] not in {
                 "raw",
                 "branded",
@@ -944,6 +996,177 @@ class DashboardController:
                     }
                 )
         return {"ok": True, "episodes": items}
+
+    # -- OUSSAMA Cutter (external, GPL sidecar) -------------------------
+
+    def cutter_recordings(self) -> dict[str, Any]:
+        state_dir = self._current_state_dir(self._values())
+        folder = state_dir / "recordings"
+        items: list[dict[str, Any]] = []
+        if folder.is_dir():
+            for path in sorted(
+                folder.iterdir(), key=lambda item: item.stat().st_mtime, reverse=True
+            ):
+                if not path.is_file() or path.suffix.lower() not in {
+                    ".mp4",
+                    ".mov",
+                    ".mkv",
+                    ".webm",
+                    ".m4v",
+                    ".ts",
+                }:
+                    continue
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                items.append(
+                    {
+                        "name": path.name,
+                        "path": str(path),
+                        "size": stat.st_size,
+                        "modified": stat.st_mtime,
+                    }
+                )
+                if len(items) >= 20:
+                    break
+        return {"ok": True, "recordings": items}
+
+    def cutter_check(self) -> dict[str, Any]:
+        settings = CutterSettings.from_values(self._values(), base=self.project_root)
+        client = CutterClient(settings)
+        available, message = client.available()
+        projects = cutter_projects(settings.home) if settings.home.is_dir() else []
+        return {
+            "ok": True,
+            "available": available,
+            "message": message,
+            "home": str(settings.home),
+            "python": settings.resolved_python(),
+            "recordings": self.cutter_recordings()["recordings"],
+            "projects": projects,
+        }
+
+    def cutter_start(self, data: Mapping[str, Any]) -> dict[str, Any]:
+        settings = CutterSettings.from_values(self._values(), base=self.project_root)
+        client = CutterClient(settings)
+        available, message = client.available()
+        if not available:
+            raise CutterError(message)
+        state_dir = self._current_state_dir(self._values()).resolve()
+        recording_text = str(data.get("recording") or "").strip()
+        if recording_text:
+            recording = Path(recording_text).expanduser().resolve()
+            recordings_dir = (state_dir / "recordings").resolve()
+            allowed = (
+                recordings_dir in recording.parents
+                or self.project_root in recording.parents
+            )
+            if not allowed:
+                raise ValueError("اختر تسجيلاً من مجلد التسجيلات أو من مجلد المشروع.")
+        else:
+            latest = latest_recording(state_dir)
+            if latest is None:
+                raise ValueError(
+                    "لا توجد تسجيلات جاهزة. أوقف البث أولاً ثم أعد المحاولة."
+                )
+            recording = latest
+        try:
+            workflow = int(data.get("workflow") or settings.workflow)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("وضع المعالجة غير صالح.") from exc
+        command = client.build_command(recording, workflow=workflow)
+        with self._cutter_lock:
+            if self._cutter_thread is not None and self._cutter_thread.is_alive():
+                raise RuntimeError("هناك تحليل قيد التنفيذ بالفعل.")
+            self._cutter_job = {
+                "running": True,
+                "phase": "بدء",
+                "started_at": time.time(),
+                "recording": str(recording),
+                "project": "",
+                "clips": 0,
+                "error": "",
+                "log": [],
+                "workflow": workflow,
+                "command": command,
+            }
+            self._cutter_thread = threading.Thread(
+                target=self._run_cutter,
+                args=(client, recording, workflow, bool(data.get("force"))),
+                daemon=True,
+                name="cutter-job",
+            )
+            self._cutter_thread.start()
+            return {"ok": True, **dict(self._cutter_job)}
+
+    def _run_cutter(
+        self,
+        client: CutterClient,
+        recording: Path,
+        workflow: int,
+        force: bool,
+    ) -> None:
+        def log(line: str) -> None:
+            with self._cutter_lock:
+                entries = self._cutter_job.setdefault("log", [])
+                entries.append(line)
+                del entries[:-300]
+                self._cutter_job["phase"] = "تحليل"
+
+        try:
+            result = client.run(recording, log=log, force=force)
+        except Exception as exc:
+            LOGGER.exception("cutter job failed")
+            with self._cutter_lock:
+                self._cutter_job.update(
+                    running=False, phase="فشل", error=str(exc)[:800]
+                )
+            return
+        with self._cutter_lock:
+            self._cutter_job.update(
+                running=False,
+                phase="انتهى",
+                project=str(result.project),
+                clips=len(result.clips),
+                result=result.as_dict(),
+                log=result.log_tail[-120:],
+            )
+
+    def cutter_status(self) -> dict[str, Any]:
+        with self._cutter_lock:
+            job = dict(self._cutter_job)
+            job["log"] = list(job.get("log") or [])
+        if not job:
+            return {"ok": True, "running": False}
+        return {"ok": True, **job}
+
+    def cutter_clips(self, project_text: str = "") -> dict[str, Any]:
+        settings = CutterSettings.from_values(self._values(), base=self.project_root)
+        projects = cutter_projects(settings.home) if settings.home.is_dir() else []
+        selected: Path | None = None
+        if project_text.strip():
+            candidate = Path(project_text).expanduser().resolve()
+            virals = (settings.home / "VIRALS").resolve()
+            if candidate.parent != virals or not candidate.is_dir():
+                raise ValueError("مجلد المقاطع غير صالح.")
+            selected = candidate
+        elif projects:
+            selected = Path(projects[0]["path"])
+        clips: list[dict[str, Any]] = []
+        if selected is not None:
+            try:
+                clips = [clip.as_dict() for clip in clips_from_project(selected)]
+            except CutterError:
+                clips = []
+        return {
+            "ok": True,
+            "project": str(selected) if selected else "",
+            "name": selected.name if selected else "",
+            "clips": clips,
+            "projects": projects,
+            "recordings": self.cutter_recordings()["recordings"],
+        }
 
     def _metadata_from_request(self, data: dict[str, Any]) -> StreamMetadata:
         raw_title = str(data.get("title", ""))
@@ -1777,6 +2000,19 @@ def build_handler_class(
                 self._json(controller.session_markers())
             elif request_path == "/api/episodes":
                 self._json(controller.list_episodes())
+            elif request_path == "/api/clips":
+                query = urlsplit(self.path).query
+                project = ""
+                for part in query.split("&"):
+                    if part.startswith("project="):
+                        from urllib.parse import unquote
+
+                        project = unquote(part.split("=", 1)[1])
+                self._json(controller.cutter_clips(project))
+            elif request_path == "/api/clips/check":
+                self._json(controller.cutter_check())
+            elif request_path == "/api/clips/status":
+                self._json(controller.cutter_status())
             elif request_path == "/api/episodes/status":
                 self._json(controller.episode_status())
             elif request_path == "/api/reports/weekly":
@@ -1886,6 +2122,8 @@ def build_handler_class(
                     self._json(controller.metadata_suggest(data))
                 elif request_path == "/api/newsroom/brief":
                     self._json(controller.newsroom_brief(data))
+                elif request_path == "/api/clips/analyze":
+                    self._json(controller.cutter_start(data), 202)
                 elif request_path == "/api/episodes/sample":
                     self._json(controller.episode_sample())
                 elif request_path == "/api/episodes/plan":
