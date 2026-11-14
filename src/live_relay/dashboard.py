@@ -20,6 +20,8 @@ from urllib.parse import urlsplit
 
 from dotenv import dotenv_values, load_dotenv, set_key
 
+from . import __version__
+from .backup import build_export, validate_import
 from .config import (
     default_state_dir,
     ensure_private_dir,
@@ -131,6 +133,24 @@ CONFIG_KEYS = (
     "STALL_TIMEOUT",
     "HEARTBEAT",
     "SOURCE_END_GRACE",
+)
+
+BACKUP_EXTRA_KEYS = (
+    "YOUTUBE_MANUAL_AUTH",
+    "GEMINI_THUMBNAIL_ENABLED",
+    "GEMINI_IMAGE_MODEL",
+    "NOTIFY_TELEGRAM_CHAT",
+    "NOTIFY_LANGUAGE",
+    "RECORD_ENABLED",
+    "RECORDING_RETENTION_DAYS",
+    "RECORDING_MAX_GB",
+    "LOG_LEVEL",
+    "LIVE_RELAY_STATE_DIR",
+)
+BACKUP_SECRET_KEYS = (
+    *SECRET_KEYS,
+    "NOTIFY_TELEGRAM_TOKEN",
+    "NOTIFY_WEBHOOK_URL",
 )
 
 METADATA_OVERRIDE_KEYS = {
@@ -714,6 +734,62 @@ class DashboardController:
             if updates.get("FACEBOOK_ACCESS_TOKEN", "").strip():
                 self._write_token_meta(saved_at=time.time())
             return self.public_config()
+
+    def _apply_env(self, updates: dict[str, str]) -> None:
+        """Write .env updates and validate them; restore on any failure."""
+        snapshot = None
+        if self.env_path.is_file():
+            snapshot = self.env_path.read_bytes()
+        try:
+            for key, value in updates.items():
+                set_key(str(self.env_path), key, value, quote_mode="auto")
+            try:
+                os.chmod(self.env_path, 0o600)
+            except OSError:
+                pass
+            load_dotenv(self.env_path, override=True)
+            load_settings()
+        except Exception:
+            if snapshot is not None:
+                self.env_path.write_bytes(snapshot)
+                try:
+                    os.chmod(self.env_path, 0o600)
+                except OSError:
+                    pass
+                load_dotenv(self.env_path, override=True)
+            raise
+
+    def export_config(self, include_secrets: bool = False) -> dict[str, Any]:
+        payload = build_export(
+            self._values(),
+            config_keys=(*CONFIG_KEYS, *BACKUP_EXTRA_KEYS),
+            secret_keys=BACKUP_SECRET_KEYS,
+            version=__version__,
+            include_secrets=include_secrets,
+        )
+        return payload
+
+    def import_config(self, payload: Any) -> dict[str, Any]:
+        with self._lock:
+            if self._is_running():
+                raise RuntimeError("أوقف البث قبل استيراد الإعدادات.")
+            config, secrets = validate_import(
+                payload,
+                config_keys=(*CONFIG_KEYS, *BACKUP_EXTRA_KEYS),
+                secret_keys=BACKUP_SECRET_KEYS,
+            )
+            updates = {**config, **secrets}
+            if not updates:
+                raise ValueError("الملف لا يحتوي أي إعداد قابل للتطبيق.")
+            self._apply_env(updates)
+            if secrets.get("FACEBOOK_ACCESS_TOKEN", "").strip():
+                self._write_token_meta(saved_at=time.time())
+            return {
+                "ok": True,
+                "config": self.public_config(),
+                "applied": len(updates),
+                "secrets": len(secrets),
+            }
 
     def _metadata_from_request(self, data: dict[str, Any]) -> StreamMetadata:
         raw_title = str(data.get("title", ""))
@@ -1637,6 +1713,17 @@ def build_handler_class(
                     self._json(controller.monetization_audit(data))
                 elif request_path == "/api/youtube/thumbnail/generate":
                     self._json(controller.generate_thumbnail_now(data))
+                elif request_path == "/api/config/export":
+                    self._json(
+                        {
+                            "ok": True,
+                            "payload": controller.export_config(
+                                bool(data.get("include_secrets"))
+                            ),
+                        }
+                    )
+                elif request_path == "/api/config/import":
+                    self._json(controller.import_config(data.get("payload", data)))
                 elif request_path == "/api/metadata/suggest":
                     self._json(controller.metadata_suggest(data))
                 elif request_path == "/api/newsroom/brief":
