@@ -9,7 +9,7 @@ if (-not (Test-Path $Python)) {
     throw "Run start_live_relay.bat once to create .venv before installing the task."
 }
 
-$Action = New-ScheduledTaskAction -Execute $Python -Argument "-m live_relay --headless" -WorkingDirectory $Root
+$Action = New-ScheduledTaskAction -Execute $Python -Argument "-m live_relay --service --dashboard-port 8765" -WorkingDirectory $Root
 $Trigger = New-ScheduledTaskTrigger -AtLogOn
 $Settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
@@ -22,7 +22,7 @@ Register-ScheduledTask `
     -Action $Action `
     -Trigger $Trigger `
     -Settings $Settings `
-    -Description "Live Relay — 24/7 broadcast relay" `
+    -Description "Live Relay — 24/7 broadcast relay, dashboard and post-stream automation" `
     -Force | Out-Null
 
 Write-Host "Registered the 'Live Relay' task. Start it from Task Scheduler or reboot."

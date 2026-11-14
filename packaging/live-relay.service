@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 # Adjust this path if the project lives elsewhere.
 WorkingDirectory=%h/live-relay
-ExecStart=%h/live-relay/.venv/bin/python -m live_relay --headless
+ExecStart=%h/live-relay/.venv/bin/python -m live_relay --service --dashboard-port 8765
 Environment=PYTHONUNBUFFERED=1
 # The built-in supervisor restarts the relay in-process; systemd restarts it
 # if the whole process dies.

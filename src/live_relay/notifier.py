@@ -19,6 +19,8 @@ _EVENT_LABELS = {
         "relay_ended": "⏹️ انتهى البث",
         "relay_stopped": "⏹️ تم إيقاف المُرحِّل",
         "relay_crashed": "🛠️ عطل غير متوقع في المُرحِّل",
+        "pipeline_done": "✅ اكتملت معالجة الحلقة",
+        "pipeline_failed": "⚠️ فشل في معالجة الحلقة",
     },
     "en": {
         "session_started": "🔴 Live relay started",
@@ -26,6 +28,8 @@ _EVENT_LABELS = {
         "relay_ended": "⏹️ Live relay ended",
         "relay_stopped": "⏹️ Relay stopped",
         "relay_crashed": "🛠️ Relay crashed unexpectedly",
+        "pipeline_done": "✅ Episode processing finished",
+        "pipeline_failed": "⚠️ Episode processing failed",
     },
 }
 
@@ -38,6 +42,9 @@ _FIELD_LABELS = {
         "quality": "الجودة",
         "duration": "المدة",
         "reconnect_in": "إعادة المحاولة بعد",
+        "clips": "المقاطع",
+        "episode": "الحلقة",
+        "uploads": "الرفع",
     },
     "en": {
         "title": "Title",
@@ -47,6 +54,9 @@ _FIELD_LABELS = {
         "quality": "Quality",
         "duration": "Duration",
         "reconnect_in": "Reconnect in",
+        "clips": "Clips",
+        "episode": "Episode",
+        "uploads": "Uploads",
     },
 }
 

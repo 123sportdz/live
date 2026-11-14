@@ -15,6 +15,8 @@ from .dashboard import DashboardController, run_dashboard
 from .destinations import YouTubeDestination
 from .encoder import redact_urls, resolve_ffmpeg
 from .monetization import audit_session, facts_from_settings
+from .notifier import notifier_from_settings
+from .pipeline import PipelineWorker
 from .service import install_signal_handlers
 from .supervisor import RelaySupervisor
 
@@ -102,6 +104,11 @@ def main() -> int:
         action="store_true",
         help="run the relay without the local dashboard",
     )
+    group.add_argument(
+        "--service",
+        action="store_true",
+        help="run the dashboard, relay and automation at logon (no browser)",
+    )
     parser.add_argument(
         "--dashboard-port", type=int, default=8765, help="local dashboard port"
     )
@@ -112,10 +119,23 @@ def main() -> int:
     )
     args = parser.parse_args()
     try:
-        if not (args.check or args.authorize_youtube or args.headless):
+        if not (
+            args.check
+            or args.authorize_youtube
+            or args.headless
+            or args.service
+        ):
             run_dashboard(PROJECT_ROOT, args.dashboard_port, not args.no_browser)
             return 0
         load_dotenv(PROJECT_ROOT / ".env", override=True)
+        if args.service:
+            run_dashboard(
+                PROJECT_ROOT,
+                args.dashboard_port,
+                False,
+                autostart=True,
+            )
+            return 0
         if args.authorize_youtube:
             controller = DashboardController(PROJECT_ROOT)
             controller.discover_youtube_client_file()
@@ -153,7 +173,18 @@ def main() -> int:
             )
         stopped = threading.Event()
         install_signal_handlers(stopped)
-        RelaySupervisor(settings, stopped).run()
+        supervisor = RelaySupervisor(settings, stopped)
+        worker = PipelineWorker(
+            PROJECT_ROOT,
+            settings.state_dir,
+            busy=lambda: bool(supervisor.status.snapshot().get("is_running")),
+            notifier=notifier_from_settings(settings),
+        )
+        worker.start()
+        try:
+            supervisor.run()
+        finally:
+            worker.stop()
         return 0
     except (RuntimeError, ValueError, OSError) as exc:
         logging.error("%s", redact_urls(str(exc))[:500])

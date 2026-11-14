@@ -27,6 +27,7 @@ from .metadata import (
     local_metadata,
     source_metadata,
 )
+from .pipeline import enqueue_finished
 from .monetization import (
     SessionFacts,
     audit_session,
@@ -902,6 +903,17 @@ def _finalize_session(
             chapters=chapters,
             kit=kit_path,
         )
+        recording = str(getattr(session, "recording_path", "") or "")
+        if recording:
+            try:
+                enqueue_finished(
+                    state_dir,
+                    recording,
+                    video_id=session.video_id,
+                    ended_at=ended,
+                )
+            except Exception as exc:  # automation must never block a safe shutdown
+                logging.warning("Could not queue the post-stream job: %s", exc)
         prune_from_settings(settings)
     except Exception as exc:  # history must never block a safe shutdown
         logging.warning("Could not record the finished session: %s", exc)

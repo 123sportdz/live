@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -22,6 +23,13 @@ from dotenv import dotenv_values, load_dotenv, set_key
 
 from . import __version__
 from .backup import build_export, validate_import
+from .notifier import Notifier
+from .pipeline import (
+    PipelineConfig,
+    PipelineStore,
+    PipelineWorker,
+    automation_warnings,
+)
 from .episode import (
     MIN_SECONDS,
     EpisodeError,
@@ -252,6 +260,8 @@ class DashboardController:
         self._cutter_lock = threading.Lock()
         self._cutter_thread: threading.Thread | None = None
         self._cutter_job: dict[str, Any] = {}
+        self._pipeline_lock = threading.Lock()
+        self._pipeline_worker: PipelineWorker | None = None
         self.status = RelayStatus()
         self.control_token = secrets.token_urlsafe(32)
         self.ensure_env_file()
@@ -909,6 +919,8 @@ class DashboardController:
         with self._episode_lock:
             if self._episode_thread is not None and self._episode_thread.is_alive():
                 raise RuntimeError("هناك حلقة قيد البناء بالفعل.")
+            if self._pipeline_active():
+                raise RuntimeError("الأتمتة تعمل الآن؛ انتظر انتهاءها ثم أعد المحاولة.")
             plan = load_manifest(self._episode_manifest(data.get("manifest")))
             allow_short = bool(data.get("allow_short"))
             if plan.total_seconds < MIN_SECONDS and not allow_short:
@@ -1048,6 +1060,8 @@ class DashboardController:
         }
 
     def cutter_start(self, data: Mapping[str, Any]) -> dict[str, Any]:
+        if self._pipeline_active():
+            raise RuntimeError("الأتمتة تعمل الآن؛ انتظر انتهاءها ثم أعد المحاولة.")
         settings = CutterSettings.from_values(self._values(), base=self.project_root)
         client = CutterClient(settings)
         available, message = client.available()
@@ -1167,6 +1181,160 @@ class DashboardController:
             "projects": projects,
             "recordings": self.cutter_recordings()["recordings"],
         }
+
+    # -- automation pipeline -------------------------------------------
+
+    def _notifier(self) -> Notifier:
+        values = self._values()
+        return Notifier(
+            telegram_token=str(values.get("NOTIFY_TELEGRAM_TOKEN") or ""),
+            telegram_chat=str(values.get("NOTIFY_TELEGRAM_CHAT") or ""),
+            webhook_url=str(values.get("NOTIFY_WEBHOOK_URL") or ""),
+            language=str(values.get("NOTIFY_LANGUAGE") or "ar"),
+        )
+
+    def _pipeline_active(self) -> bool:
+        worker = self._pipeline_worker
+        if worker is None:
+            return False
+        try:
+            return bool(worker.status().get("current"))
+        except Exception:
+            return False
+
+    def _busy_for_pipeline(self) -> bool:
+        return (
+            self._is_running()
+            or (self._cutter_thread is not None and self._cutter_thread.is_alive())
+            or (self._episode_thread is not None and self._episode_thread.is_alive())
+        )
+
+    def _ensure_pipeline(self) -> PipelineWorker:
+        with self._pipeline_lock:
+            if self._pipeline_worker is None:
+                self._pipeline_worker = PipelineWorker(
+                    self.project_root,
+                    self._current_state_dir(self._values()),
+                    busy=self._busy_for_pipeline,
+                    notifier=self._notifier(),
+                )
+            if not self._pipeline_worker.running:
+                self._pipeline_worker.start()
+            return self._pipeline_worker
+
+    def start_automation(self) -> None:
+        self._ensure_pipeline()
+
+    def stop_automation(self) -> None:
+        with self._pipeline_lock:
+            worker = self._pipeline_worker
+        if worker is not None:
+            worker.stop()
+
+    def automation_status(self) -> dict[str, Any]:
+        config = PipelineConfig.from_env(self.project_root)
+        worker = self._ensure_pipeline()
+        status = worker.status()
+        warnings = automation_warnings(config)
+        if status.get("blocked_reason"):
+            warnings.append(status["blocked_reason"])
+        return {
+            "ok": True,
+            **status,
+            "config": config.as_dict(),
+            "warnings": warnings,
+            "recordings": self.cutter_recordings()["recordings"],
+        }
+
+    def save_automation(self, data: Mapping[str, Any]) -> dict[str, Any]:
+        privacy = str(data.get("upload_privacy") or "private").lower()
+        if privacy not in {"private", "unlisted", "public"}:
+            raise ValueError("خصوصية الرفع يجب أن تكون private أو unlisted أو public.")
+        try:
+            upload_max = max(0, min(10, int(data.get("upload_max", 3))))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("حد الرفع يجب أن يكون رقماً بين 0 و10.") from exc
+        try:
+            min_free = max(0.0, min(1000.0, float(data.get("min_free_gb", 5))))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("حد المساحة يجب أن يكون رقماً.") from exc
+        updates = {
+            "AUTOPILOT_ENABLED": "true" if data.get("enabled") else "false",
+            "AUTO_CLIPS": "true" if data.get("auto_clips") else "false",
+            "AUTO_EPISODE": "true" if data.get("auto_episode") else "false",
+            "AUTO_UPLOAD": "true" if data.get("auto_upload") else "false",
+            "AUTO_UPLOAD_PRIVACY": privacy,
+            "AUTO_UPLOAD_MAX": str(upload_max),
+            "PIPELINE_MIN_FREE_GB": f"{min_free:g}",
+        }
+        with self._lock:
+            for key, value in updates.items():
+                set_key(str(self.env_path), key, value, quote_mode="auto")
+            try:
+                os.chmod(self.env_path, 0o600)
+            except OSError:
+                pass
+            load_dotenv(self.env_path, override=True)
+        worker = self._ensure_pipeline()
+        worker.wake()
+        config = PipelineConfig.from_env(self.project_root)
+        return {
+            "ok": True,
+            "config": config.as_dict(),
+            "warnings": automation_warnings(config),
+        }
+
+    def _pipeline_recording(self, value: Any) -> Path:
+        state_dir = self._current_state_dir(self._values()).resolve()
+        text = str(value or "").strip()
+        if text:
+            path = Path(text).expanduser().resolve()
+            recordings = (state_dir / "recordings").resolve()
+            if recordings not in path.parents and self.project_root not in path.parents:
+                raise ValueError("اختر تسجيلاً من مجلد التسجيلات أو من مجلد المشروع.")
+            if not path.is_file():
+                raise ValueError("ملف التسجيل غير موجود.")
+            if path.suffix.lower() not in {
+                ".mp4",
+                ".mov",
+                ".mkv",
+                ".webm",
+                ".m4v",
+                ".ts",
+            }:
+                raise ValueError("صيغة التسجيل غير مدعومة.")
+            return path
+        latest = latest_recording(state_dir)
+        if latest is None:
+            raise ValueError("لا توجد تسجيلات جاهزة. أوقف البث أولاً ثم أعد المحاولة.")
+        return latest
+
+    def automation_enqueue(self, data: Mapping[str, Any]) -> dict[str, Any]:
+        recording = self._pipeline_recording(data.get("recording"))
+        store = PipelineStore(self._current_state_dir(self._values()))
+        job = store.enqueue(
+            recording,
+            force=bool(data.get("force")),
+            manual=True,
+        )
+        worker = self._ensure_pipeline()
+        worker.wake()
+        config = PipelineConfig.from_env(self.project_root)
+        return {
+            "ok": True,
+            "job": job,
+            "warnings": automation_warnings(config),
+        }
+
+    def automation_retry(self, data: Mapping[str, Any]) -> dict[str, Any]:
+        job_id = str(data.get("job_id") or "").strip()
+        if not job_id:
+            raise ValueError("معرّف المهمة مطلوب.")
+        job = PipelineStore(self._current_state_dir(self._values())).retry(job_id)
+        if job is None:
+            raise ValueError("المهمة غير موجودة.")
+        self._ensure_pipeline().wake()
+        return {"ok": True, "job": job}
 
     def _metadata_from_request(self, data: dict[str, Any]) -> StreamMetadata:
         raw_title = str(data.get("title", ""))
@@ -2000,6 +2168,8 @@ def build_handler_class(
                 self._json(controller.session_markers())
             elif request_path == "/api/episodes":
                 self._json(controller.list_episodes())
+            elif request_path == "/api/automation":
+                self._json(controller.automation_status())
             elif request_path == "/api/clips":
                 query = urlsplit(self.path).query
                 project = ""
@@ -2122,6 +2292,12 @@ def build_handler_class(
                     self._json(controller.metadata_suggest(data))
                 elif request_path == "/api/newsroom/brief":
                     self._json(controller.newsroom_brief(data))
+                elif request_path == "/api/automation/config":
+                    self._json(controller.save_automation(data))
+                elif request_path == "/api/automation/run":
+                    self._json(controller.automation_enqueue(data), 202)
+                elif request_path == "/api/automation/retry":
+                    self._json(controller.automation_retry(data))
                 elif request_path == "/api/clips/analyze":
                     self._json(controller.cutter_start(data), 202)
                 elif request_path == "/api/episodes/sample":
@@ -2186,7 +2362,10 @@ def build_handler_class(
 
 
 def run_dashboard(
-    project_root: Path = PROJECT_ROOT, port: int = 8765, open_browser: bool = True
+    project_root: Path = PROJECT_ROOT,
+    port: int = 8765,
+    open_browser: bool = True,
+    autostart: bool = False,
 ) -> None:
     controller = DashboardController(project_root)
     values = controller._values()
@@ -2206,6 +2385,17 @@ def run_dashboard(
             ),
         ],
     )
+    controller.start_automation()
+    if autostart:
+        try:
+            if not controller._is_running():
+                controller.start_relay()
+                logging.info("Relay started automatically")
+        except Exception as exc:
+            logging.error(
+                "Could not start the relay automatically: %s",
+                redact_urls(str(exc))[:300],
+            )
     html_path = Path(__file__).with_name("dashboard.html")
 
     Handler = build_handler_class(controller, html_path)
@@ -2224,6 +2414,15 @@ def run_dashboard(
         server = DashboardServer(("127.0.0.1", 0), Handler)
     url = f"http://127.0.0.1:{server.server_address[1]}/"
     logging.info("Local dashboard: %s", url)
+
+    def _request_shutdown(_signum: int, _frame: Any) -> None:
+        logging.info("Shutdown requested")
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    try:
+        signal.signal(signal.SIGTERM, _request_shutdown)
+    except (AttributeError, ValueError):
+        pass
     if open_browser:
         webbrowser.open(url)
     try:
@@ -2231,6 +2430,7 @@ def run_dashboard(
     except KeyboardInterrupt:
         logging.info("Dashboard shutdown requested")
     finally:
+        controller.stop_automation()
         controller.stop_relay()
         relay_thread = controller._relay_thread
         if relay_thread:
